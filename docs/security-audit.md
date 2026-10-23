@@ -19,12 +19,15 @@ The scanner is a **single self-contained Python script** with only two well-know
   TLS on by default, sensitive-header stripping across redirects).
 - **It is an *active* probe, not a passive check.** By design it tries to exhaust PHP's memory while
   parsing a crafted multipart body, which can momentarily crash the PHP worker handling that request.
-- **Its verdicts need interpretation.** Several verdict paths (notably the empty-500 crash signal and
-  the version-string check) produce known false positives / false negatives. Treat a raw `VULNERABLE`
-  as "investigate", not "confirmed".
+- **Verdicts now use a confidence model (§4).** A hard `VULNERABLE` requires either a crash the version
+  corroborates or a strong in-band PHP fatal error; the ambiguous cases (empty-500 with no version;
+  unpatched-looking version with no crash — i.e. distro/source backports) report the distinct
+  **`POTENTIALLY VULNERABLE`** verdict instead of a false positive. A patched version string overrides any
+  crash symptom.
 
-**Bottom line:** safe to run against your own site; trustworthy on *where it sends data*; its *verdicts*
-should be corroborated against the server's actual installed PHP build.
+**Bottom line:** safe to run against your own site; trustworthy on *where it sends data*; a `VULNERABLE`
+verdict is confirmed, a `POTENTIALLY VULNERABLE` verdict is the one to corroborate against the server's
+actual installed PHP build.
 
 ---
 
@@ -85,31 +88,45 @@ each exchange bounded.
 
 ## 4. Detection-logic validity (how much to trust a verdict)
 
-Verdict core: `check_url` (`scanner.py:795-964`), `crash_signal` (`scanner.py:653-702`),
-`version_verdict` + `FIXED_VERSIONS` (`scanner.py:63,642-650`).
+Verdict core: `check_url` (`scanner.py:807+`), `crash_signal` (`scanner.py:666-720`),
+`version_verdict` + `FIXED_VERSIONS` (`scanner.py:64-69,648-663`).
 
-### 4.1 Crash signals, in priority order
+**The scanner uses a confidence model:** a behavioural crash signal and the advertised version are
+cross-checked, and neither alone forces a hard `VULNERABLE`. A fifth verdict,
+**`POTENTIALLY VULNERABLE`** (`vulnerable: null`), carries the cases that cannot be confirmed from the
+probe, so a hard `VULNERABLE` means *confirmed* and false positives are avoided.
+
+### 4.1 Crash signals and their confidence
+`crash_signal` returns a confidence alongside the reason (`scanner.py:666-720`):
+
 | Signal | Condition | Fires in SAPI modes | Confidence |
 |---|---|---|---|
-| **Strong** | probe body contains `Allowed memory size of` + `bytes exhausted` + `Unknown` | all | High — real PHP fatal-error text |
-| **Ambiguous** | probe is HTTP 500 with **empty body** while control produced a body | all | Low — see 4.2 |
-| FPM worker died | probe status 502/503/504 | auto, fpm | Medium — could be proxy/WAF |
-| FPM worker died | probe is HTTP 200 with **empty body** while control produced a body | auto, fpm | Medium |
+| In-band fatal error | probe body has `Allowed memory size of` + `bytes exhausted` + `Unknown` | all | **strong** |
+| Empty 500 | probe is HTTP 500 with **empty body** while control produced a body | all | weak |
+| FPM worker died | probe status 502/503/504 | auto, fpm | weak |
+| FPM worker died | probe is HTTP 200 with **empty body** while control produced a body | auto, fpm | weak |
 
-### 4.2 A crash signal overrides the patched-version check (false-positive path)
-Within a probe iteration, `crash_signal` is evaluated and returned on (`scanner.py:917-926`) **before**
-the `FIXED` version check (`scanner.py:928`). So a **patched** server that merely OOMs on the 20 MiB
-probe and returns an empty 500 is reported **`VULNERABLE`** — and the "this is a patched version" check
-is never reached. This matches the upstream-documented false positive (patched PHP 8.4.27 with low
-`memory_limit`; PHP 8.3.36 at 128M with a high `max_multipart_body_parts`).
-→ **If the reason is "HTTP 500 with an empty body", treat it as unconfirmed.**
+A **weak** signal matches the documented benign out-of-memory response a *patched* build returns when the
+probe merely exceeds `memory_limit`, so it needs corroboration before it is trusted.
 
-### 4.3 Version-based verdict is unreliable on distro packages
-`FIXED_VERSIONS = {8.2: 35, 8.3: 36, 8.4: 27, 8.5: 12}` compares only the patch number from
-`X-Powered-By`. Debian/RHEL/Ubuntu **backport** the fix while keeping the version string (e.g. a patched
-`8.2.7`), which this logic would call **`VULNERABLE`** (7 < 35).
-→ **If the reason is "X-Powered-By reports an unpatched release", verify with `php -v` and the distro's
-security changelog, not the header.**
+### 4.2 Empty-500 overriding the patched-version check — FIXED
+Previously `crash_signal` was evaluated and returned on **before** the `FIXED` version check, so a patched
+server that merely OOM'd on the 20 MiB probe (empty 500) was reported `VULNERABLE`. Now the version is
+checked **first** (`scanner.py` loop): if `X-Powered-By` reports a **patched** release, that is
+authoritative and any memory-exhaustion symptom (even the strong in-band error) is treated as a benign OOM
+→ verdict **`FIXED`**. The documented false positive (patched 8.4.27 at low `memory_limit`; 8.3.36 at 128M
+with high `max_multipart_body_parts`) no longer produces a `VULNERABLE`.
+→ A weak signal with **no** version to corroborate is reported **`POTENTIALLY VULNERABLE`**, not
+`VULNERABLE`; a strong in-band fatal error is still `VULNERABLE` on its own.
+
+### 4.3 Distro-backport false positive — FIXED
+`FIXED_VERSIONS` compares only the patch number from `X-Powered-By`, and Debian/RHEL/Ubuntu **backport**
+the fix while keeping the upstream version string (e.g. a patched `8.2.7`). A version that *looks*
+unpatched is therefore no longer reported as a hard `VULNERABLE` on its own: with **no behavioural crash**
+to confirm it, the verdict is **`POTENTIALLY VULNERABLE`** with a reason noting a backport may have patched
+it. A hard `VULNERABLE` now requires a crash signal that the version **corroborates** (unpatched/EOL), or a
+strong in-band fatal error.
+→ Confirm a `POTENTIALLY VULNERABLE` with `php -v` and the distro's security changelog.
 
 ### 4.4 Version coverage (blind spot closed)
 `FIXED_VERSIONS` lists the four confirmed official fix points (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12,
@@ -118,15 +135,14 @@ lifecycle position so no advertised version falls through to `NO SIGNAL`:
 
 - Branch **in** the map → exact patch comparison → `FIXED` / `VULNERABLE`.
 - Branch **older** than the oldest entry (8.1, 8.0, 7.x, 5.x — the flaw reaches back to PHP 5.4 and these
-  received no official release) → **`EOL`**, reported as `VULNERABLE` with an end-of-life reason string.
+  received no official release) → **`EOL`**.
 - Branch **newer** than the newest entry (8.6+, 9.x — ships with the fix upstream) → **`FIXED`**.
-- No `PHP/x.y.z` in `X-Powered-By` → `None` → relies on the crash signals (unchanged).
+- No `PHP/x.y.z` in `X-Powered-By` → `None` → relies on the crash signals.
 
-**Remaining caveat (safe direction):** PHP published *source-only* backports for 7.4 / 8.0 / 8.1. A server
-that applied one is actually patched but still advertises an EOL version, so it will be reported
-`VULNERABLE`. This is the same backport ambiguity as §4.3, erring toward flagging for review — acceptable
-because such hosts are unsupported regardless. Confirm with `php -v` + the applied backport.
-→ `NO SIGNAL` now occurs only when **no** PHP version is advertised, not for any known branch.
+An `EOL`/unpatched branch is combined with the behavioural signal per §4.2–§4.3: with a corroborating
+crash it is `VULNERABLE`, without a crash it is `POTENTIALLY VULNERABLE` (a *source-only* backport —
+published for 7.4 / 8.0 / 8.1 — may have patched it while keeping the version string). `NO SIGNAL` now
+occurs only when **no** PHP version is advertised and no crash fires.
 
 ### 4.5 Header dependence
 If you hide `X-Powered-By` (common hardening), the version path is inert and detection relies entirely on
@@ -192,11 +208,13 @@ tool's provenance or of the vulnerability claims.
 
 1. `pip install -r requirements.txt`, then run with `-v` and capture evidence:
    `python3 scanner.py -u https://yourdomain.example -v -o result.json`
-2. Map the verdict:
-   - `VULNERABLE` / reason "memory exhausted in Unknown" → strong; still confirm by patching + re-running.
-   - `VULNERABLE` / reason "empty body" **or** "X-Powered-By ... unpatched" → *unconfirmed* (§4.2, §4.3).
-   - `FIXED` → trustworthy only if `X-Powered-By` is real and not a backport string.
-   - `NO SIGNAL` / `INCONCLUSIVE` → not "safe" (§4.4, §4.5); check the installed PHP version directly.
+2. Map the verdict (confidence model, §4):
+   - `VULNERABLE` → confirmed: a crash the version corroborates, or a strong in-band PHP fatal error.
+   - `POTENTIALLY VULNERABLE` → the case to verify: an empty-body crash with no version, or an
+     unpatched-looking version with no crash (possible distro/source backport). Check `php -v` (§4.2–§4.3).
+   - `FIXED` → patched (authoritative version read; overrides any benign OOM symptom).
+   - `NO SIGNAL` / `INCONCLUSIVE` → no version advertised and no crash; check the installed PHP version
+     directly (§4.4, §4.5).
 3. The single most reliable check for your own server is non-network: run `php -v` on the box and compare
    against the fixed patch levels (8.2≥35, 8.3≥36, 8.4≥27, 8.5≥12) or confirm your distro backported the
    fix. Use the scanner to *corroborate*, not as the sole source of truth.
