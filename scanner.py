@@ -60,6 +60,11 @@ DEFAULT_USER_AGENT = (
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
+# Patch level at which each supported branch received the official fix
+# (2026-10-21). Branches outside this map are resolved by lifecycle position in
+# version_verdict: anything older than the oldest entry is end-of-life with no
+# official fix (the flaw reaches back to PHP 5.4), anything newer than the
+# newest entry ships with the fix already in.
 FIXED_VERSIONS = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 VERSION_PATTERN = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -644,10 +649,18 @@ def version_verdict(powered_by: str) -> Optional[str]:
     if not match:
         return None
     major, minor, patch = (int(value) for value in match.groups())
-    fixed_patch = FIXED_VERSIONS.get((major, minor))
-    if fixed_patch is None:
-        return None
-    return "FIXED" if patch >= fixed_patch else "VULNERABLE"
+    branch = (major, minor)
+    fixed_patch = FIXED_VERSIONS.get(branch)
+    if fixed_patch is not None:
+        return "FIXED" if patch >= fixed_patch else "VULNERABLE"
+    # No explicit fix point for this branch: decide by lifecycle position so
+    # every advertised version yields a verdict instead of a blind spot.
+    branches = sorted(FIXED_VERSIONS)
+    if branch < branches[0]:
+        return "EOL"  # older than the oldest patched branch; no official fix
+    if branch > branches[-1]:
+        return "FIXED"  # newer than the newest patched branch; fix is upstream
+    return None
 
 
 def crash_signal(
@@ -936,16 +949,23 @@ def check_url(
 
     by_version = version_verdict(powered_by)
     result["powered_by"] = powered_by or None
-    if by_version == "VULNERABLE":
+    if by_version in ("VULNERABLE", "EOL"):
         result["vulnerable"] = True
         result["verdict"] = "VULNERABLE"
         result["sapi"] = (
             "unknown" if sapi == "auto" else "PHP-FPM" if sapi == "fpm" else "mod_php"
         )
-        result["reason"] = (
-            "no crash observed; X-Powered-By reports an unpatched release: "
-            + powered_by
-        )
+        if by_version == "EOL":
+            result["reason"] = (
+                "no crash observed; X-Powered-By reports an end-of-life PHP "
+                "branch with no official fix (affected back to PHP 5.4): "
+                + powered_by
+            )
+        else:
+            result["reason"] = (
+                "no crash observed; X-Powered-By reports an unpatched release: "
+                + powered_by
+            )
     elif by_version == "FIXED":
         result["vulnerable"] = False
         result["verdict"] = "FIXED"

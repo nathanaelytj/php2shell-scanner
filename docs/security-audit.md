@@ -111,11 +111,22 @@ is never reached. This matches the upstream-documented false positive (patched P
 → **If the reason is "X-Powered-By reports an unpatched release", verify with `php -v` and the distro's
 security changelog, not the header.**
 
-### 4.4 Version coverage gaps
-`FIXED_VERSIONS` covers only **8.2–8.5**. On PHP **8.1 / 8.0 / 7.x** (EOL, genuinely unpatched) or a
-future **8.6+**, `version_verdict` returns `None`; without a crash signal the result is **`NO SIGNAL`**,
-recorded as `vulnerable: false`.
-→ **`NO SIGNAL` is not a clean bill of health** — especially on EOL PHP.
+### 4.4 Version coverage (blind spot closed)
+`FIXED_VERSIONS` lists the four confirmed official fix points (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12,
+released 2026-10-21). `version_verdict` (`scanner.py:642-661`) now resolves **every** other branch by
+lifecycle position so no advertised version falls through to `NO SIGNAL`:
+
+- Branch **in** the map → exact patch comparison → `FIXED` / `VULNERABLE`.
+- Branch **older** than the oldest entry (8.1, 8.0, 7.x, 5.x — the flaw reaches back to PHP 5.4 and these
+  received no official release) → **`EOL`**, reported as `VULNERABLE` with an end-of-life reason string.
+- Branch **newer** than the newest entry (8.6+, 9.x — ships with the fix upstream) → **`FIXED`**.
+- No `PHP/x.y.z` in `X-Powered-By` → `None` → relies on the crash signals (unchanged).
+
+**Remaining caveat (safe direction):** PHP published *source-only* backports for 7.4 / 8.0 / 8.1. A server
+that applied one is actually patched but still advertises an EOL version, so it will be reported
+`VULNERABLE`. This is the same backport ambiguity as §4.3, erring toward flagging for review — acceptable
+because such hosts are unsupported regardless. Confirm with `php -v` + the applied backport.
+→ `NO SIGNAL` now occurs only when **no** PHP version is advertised, not for any known branch.
 
 ### 4.5 Header dependence
 If you hide `X-Powered-By` (common hardening), the version path is inert and detection relies entirely on
