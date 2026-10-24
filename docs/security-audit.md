@@ -196,11 +196,42 @@ to the Assetnote Security Research Team (discovery credited to the Calif team). 
 
 1. That the committed code is byte-for-byte the upstream release — **diff this fork against the official
    Assetnote repository** before trusting it in a sensitive environment.
-2. That the CVE identifiers (`CVE-2026-109618` / `CVE-2026-109619`) and fixed-version table are accurate —
-   **confirm against the CVE records and php.net release notes.**
+2. That the committed code is byte-for-byte the upstream release — **diff this fork against the official
+   Assetnote repository** before trusting it in a sensitive environment. *(Still open.)*
 
-The audit above covers *behaviour and safety of the code as written*; it is not a verification of the
-tool's provenance or of the vulnerability claims.
+The CVE claims themselves are now verified against primary sources — see §9.
+
+The audit above covers *behaviour and safety of the code as written*; §9 covers the vulnerability claims.
+It is not a verification of the tool's byte-for-byte provenance against upstream.
+
+---
+
+## 9. CVE claim verification
+
+Verified 2026-10-24 against PHP, distro, and vendor advisories. The scanner's CVE identifiers and
+fixed-version table are **accurate**.
+
+| What the scanner asserts | Source of truth | Result |
+|---|---|---|
+| `CVE-2026-109618` / `CVE-2026-109619` are real | PHP security release; Red Hat RHSB-2026-013; VulnCheck; Datadog; Rapid7; CERT-EU 2026-018 | Confirmed |
+| `FIXED_VERSIONS = {(8,2):35, (8,3):36, (8,4):27, (8,5):12}` (`scanner.py:69`) | PHP 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12, released **2026-10-21** | Exact match |
+| 8.1 and earlier → `EOL`, no official fix (`version_verdict`, `scanner.py:648`) | 8.1 and older are end-of-life; source-only backports at most | Correct |
+| Trigger is multipart parsing driven to memory exhaustion | Advisories describe multipart behaviours driving a request OOM within apparent limits | Correct |
+| Unauthenticated, critical | CVSS v4.0 **9.2**, unauthenticated RCE | Correct (not the 10.0 some leak posts claimed) |
+
+**What the two CVEs are** (for interpreting a verdict):
+- **CVE-2026-109618** — out-of-memory bug: when memory is exhausted mid request-setup, PHP longjmps out
+  and cleanup can treat half-initialized data as valid. Multipart parsing is one trigger path.
+- **CVE-2026-109619** — stale-state bug: request-owned state can outlive its freed backing memory and be
+  read by a later request on the same persistent (FPM) worker before re-initialization.
+
+**Scope of what the scanner proves.** It detects the *triggering condition* — it drives the multipart
+parser to memory exhaustion and watches for the crash / empty-body / FPM-worker-death symptom — not
+achieved code execution. This is why a hard `VULNERABLE` requires the crash signal **and** a corroborating
+unpatched/EOL version (`check_url`, `scanner.py:961`): it confirms the host is in the affected range and
+reachable by the trigger, not that an attacker has gained execution. The authoritative, non-network
+confirmation for your own host remains `php -v` against the patch levels above (and your distro's backport
+status).
 
 ---
 
