@@ -36,6 +36,7 @@ except ImportError:
 
 
 CVES = "CVE-2026-109618 / CVE-2026-109619"
+POTENTIALLY_VULNERABLE = "POTENTIALLY VULNERABLE"
 DEFAULT_PATH = "/index.php"
 PHPMYADMIN_PATH = "/show_config_errors.php"
 PHPMYADMIN_MARKER = b"phpMyAdmin"
@@ -60,6 +61,11 @@ DEFAULT_USER_AGENT = (
 
 PROBES = ((1, 4000), (8, 1020), (20, 1020))
 REJECTED_STATUSES = {400, 403, 411, 413, 414, 417, 422, 429, 431}
+# Patch level at which each supported branch received the official fix
+# (2026-10-21). Branches outside this map are resolved by lifecycle position in
+# version_verdict: anything older than the oldest entry is end-of-life with no
+# official fix (the flaw reaches back to PHP 5.4), anything newer than the
+# newest entry ships with the fix already in.
 FIXED_VERSIONS = {(8, 2): 35, (8, 3): 36, (8, 4): 27, (8, 5): 12}
 VERSION_PATTERN = re.compile(r"PHP/(\d+)\.(\d+)\.(\d+)")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -644,62 +650,75 @@ def version_verdict(powered_by: str) -> Optional[str]:
     if not match:
         return None
     major, minor, patch = (int(value) for value in match.groups())
-    fixed_patch = FIXED_VERSIONS.get((major, minor))
-    if fixed_patch is None:
-        return None
-    return "FIXED" if patch >= fixed_patch else "VULNERABLE"
+    branch = (major, minor)
+    fixed_patch = FIXED_VERSIONS.get(branch)
+    if fixed_patch is not None:
+        return "FIXED" if patch >= fixed_patch else "VULNERABLE"
+    # No explicit fix point for this branch: decide by lifecycle position so
+    # every advertised version yields a verdict instead of a blind spot.
+    branches = sorted(FIXED_VERSIONS)
+    if branch < branches[0]:
+        return "EOL"  # older than the oldest patched branch; no official fix
+    if branch > branches[-1]:
+        return "FIXED"  # newer than the newest patched branch; fix is upstream
+    return None
 
 
 def crash_signal(
     control: HTTPResult, probe: HTTPResult, sapi: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (sapi_mode, reason, confidence) for a probe.
+
+    confidence is "strong" for an in-band PHP fatal error that names memory
+    exhaustion during multipart parsing, and "weak" for the empty-body /
+    worker-death symptoms, which a patched build can also produce when the probe
+    merely exceeds memory_limit (a benign out-of-memory response). "weak"
+    signals need a version or other corroboration before a confident verdict.
+    """
+    mode = (
+        "PHP-FPM"
+        if sapi == "fpm"
+        else "mod_php"
+        if sapi == "mod_php"
+        else "mod_php/PHP-FPM"
+    )
     if (
         b"Allowed memory size of " in probe.body
         and b" bytes exhausted" in probe.body
         and b"Unknown" in probe.body
     ):
-        mode = (
-            "PHP-FPM"
-            if sapi == "fpm"
-            else "mod_php"
-            if sapi == "mod_php"
-            else "mod_php/PHP-FPM"
-        )
         return (
             mode,
             "in-band PHP fatal error (memory exhausted in Unknown) raised while "
             "parsing the multipart body",
+            "strong",
         )
 
     if probe.status_code == 500 and control.body and not probe.body:
-        mode = (
-            "PHP-FPM"
-            if sapi == "fpm"
-            else "mod_php"
-            if sapi == "mod_php"
-            else "mod_php/PHP-FPM"
-        )
         return (
             mode,
             "HTTP 500 with an empty body although the control request produced output",
+            "weak",
         )
 
     if sapi == "mod_php":
-        return None, None
+        return None, None, None
 
     if probe.status_code in (502, 503, 504):
         return (
             "PHP-FPM",
             f"HTTP {probe.status_code} from the web server fronting PHP-FPM "
             "(worker died mid-request)",
+            "weak",
         )
     if probe.status_code == 200 and control.body and not probe.body:
         return (
             "PHP-FPM",
             "HTTP 200 with an empty body although the control request produced "
             "output (worker died mid-request)",
+            "weak",
         )
-    return None, None
+    return None, None, None
 
 
 def describe_response(response: HTTPResult) -> str:
@@ -914,38 +933,85 @@ def check_url(
             )
             break
 
-        detected_sapi, signal = crash_signal(control, probe, sapi)
-        if signal:
-            result["vulnerable"] = True
-            result["verdict"] = "VULNERABLE"
-            result["sapi"] = detected_sapi
-            result["reason"] = (
-                f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
-                f"request handler: {signal}"
-            )
-            return result
+        by_version = version_verdict(powered_by)
+        detected_sapi, signal, confidence = crash_signal(control, probe, sapi)
 
-        if version_verdict(powered_by) == "FIXED":
+        if by_version == "FIXED":
+            # The build advertises itself as patched, which is authoritative: any
+            # memory-exhaustion symptom here is a benign out-of-memory response
+            # (the probe exceeded memory_limit), not the vulnerability. This is
+            # the documented empty-500 false positive; the version wins over it.
             result["vulnerable"] = False
             result["verdict"] = "FIXED"
             result["reason"] = (
-                "no crash observed and X-Powered-By reports a patched release: "
-                + powered_by
+                "probe produced a memory-exhaustion response, but X-Powered-By "
+                "reports a patched release, so this is a benign out-of-memory "
+                "result rather than the vulnerability: " + powered_by
+                if signal
+                else "no crash observed and X-Powered-By reports a patched "
+                "release: " + powered_by
+            )
+            return result
+
+        if signal:
+            prefix = (
+                f"probe {index} ({size_mib} MiB, {parts} parts) crashed the "
+                f"request handler: {signal}"
+            )
+            if by_version in ("VULNERABLE", "EOL") or confidence == "strong":
+                # Confirmed: behaviour agrees with an unpatched/EOL version, or
+                # the probe returned an in-band PHP fatal error (strong on its
+                # own). A weak empty-body/worker-death signal alone is not enough.
+                result["vulnerable"] = True
+                result["verdict"] = "VULNERABLE"
+                result["sapi"] = detected_sapi
+                corroboration = (
+                    f"; X-Powered-By also reports an unpatched/EOL release "
+                    f"({powered_by})"
+                    if by_version in ("VULNERABLE", "EOL")
+                    else ""
+                )
+                result["reason"] = prefix + corroboration
+                return result
+            # Weak signal with no version to corroborate: a patched build that
+            # merely exceeds memory_limit produces the same empty response, so
+            # this cannot be confirmed from the probe alone.
+            result["vulnerable"] = None
+            result["verdict"] = POTENTIALLY_VULNERABLE
+            result["sapi"] = detected_sapi
+            result["reason"] = (
+                prefix + ", but no PHP version was advertised to corroborate it; "
+                "a patched build exceeding memory_limit returns the same response. "
+                "Verify the installed PHP version and patch level."
             )
             return result
 
     by_version = version_verdict(powered_by)
     result["powered_by"] = powered_by or None
-    if by_version == "VULNERABLE":
-        result["vulnerable"] = True
-        result["verdict"] = "VULNERABLE"
+    if by_version in ("VULNERABLE", "EOL"):
+        # No behavioural crash to confirm it. The version string alone cannot:
+        # distro backports (Debian/RHEL) and EOL source backports keep the
+        # upstream version number after patching, so an unpatched-looking version
+        # that does not crash under the probe may well be patched. Report as
+        # unconfirmed rather than a hard VULNERABLE to avoid the backport false
+        # positive.
+        result["vulnerable"] = None
+        result["verdict"] = POTENTIALLY_VULNERABLE
         result["sapi"] = (
             "unknown" if sapi == "auto" else "PHP-FPM" if sapi == "fpm" else "mod_php"
         )
-        result["reason"] = (
-            "no crash observed; X-Powered-By reports an unpatched release: "
-            + powered_by
-        )
+        if by_version == "EOL":
+            result["reason"] = (
+                "no crash observed; X-Powered-By reports an end-of-life PHP branch "
+                "with no official fix (affected back to PHP 5.4): " + powered_by
+                + ". A source-only backport may have patched it; verify the build."
+            )
+        else:
+            result["reason"] = (
+                "no crash observed; X-Powered-By reports a release older than the "
+                "fix (" + powered_by + "), but a distro backport may have patched "
+                "it without changing the version string; verify the build."
+            )
     elif by_version == "FIXED":
         result["vulnerable"] = False
         result["verdict"] = "FIXED"
@@ -986,7 +1052,13 @@ def check_vulnerability(
         [replace_path(normalized, path) for path in paths] if paths else [normalized]
     )
     fallback: Optional[dict] = None
-    fallback_priority = {"NO SIGNAL": 0, "FIXED": 1, "INCONCLUSIVE": 2, "ERROR": 2}
+    fallback_priority = {
+        "NO SIGNAL": 0,
+        "FIXED": 1,
+        "INCONCLUSIVE": 2,
+        "ERROR": 2,
+        POTENTIALLY_VULNERABLE: 3,
+    }
     for target_url in targets:
         result = check_url(
             normalized,
@@ -1046,7 +1118,12 @@ def save_results(
     announce: bool = True,
 ) -> bool:
     selected = (
-        [result for result in results if result.get("vulnerable") is True]
+        [
+            result
+            for result in results
+            if result.get("vulnerable") is True
+            or result.get("verdict") == POTENTIALLY_VULNERABLE
+        ]
         if vulnerable_only
         else results
     )
@@ -1071,6 +1148,8 @@ def print_result(result: dict, verbose: bool = False) -> None:
     verdict = result["verdict"]
     if result["vulnerable"] is True:
         status = colorize("[VULNERABLE]", Colors.RED + Colors.BOLD)
+    elif verdict == POTENTIALLY_VULNERABLE:
+        status = colorize("[POTENTIALLY VULNERABLE]", Colors.YELLOW + Colors.BOLD)
     elif result["vulnerable"] is False:
         status = colorize("[NOT VULNERABLE]", Colors.GREEN)
     elif verdict == "INCONCLUSIVE":
@@ -1256,7 +1335,11 @@ def main() -> None:
     if len(hosts) == 1:
         result = scan(hosts[0])
         results.append(result)
-        if not args.quiet or result["vulnerable"] is True:
+        if (
+            not args.quiet
+            or result["vulnerable"] is True
+            or result["verdict"] == POTENTIALLY_VULNERABLE
+        ):
             print_result(result, args.verbose)
     else:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
@@ -1272,8 +1355,10 @@ def main() -> None:
                     result = future.result()
                     results.append(result)
 
-                    should_print = result["vulnerable"] is True or (
-                        not args.quiet and args.verbose
+                    should_print = (
+                        result["vulnerable"] is True
+                        or result["verdict"] == POTENTIALLY_VULNERABLE
+                        or (not args.quiet and args.verbose)
                     )
                     if should_print:
                         if args.quiet:
@@ -1284,7 +1369,13 @@ def main() -> None:
                     progress.update(1)
 
     vulnerable_count = sum(result["vulnerable"] is True for result in results)
-    error_count = sum(result["vulnerable"] is None for result in results)
+    potential_count = sum(
+        result["verdict"] == POTENTIALLY_VULNERABLE for result in results
+    )
+    not_vulnerable_count = sum(result["vulnerable"] is False for result in results)
+    error_count = (
+        sum(result["vulnerable"] is None for result in results) - potential_count
+    )
     if not args.quiet:
         print()
         print(colorize("=" * 60, Colors.CYAN))
@@ -1295,7 +1386,11 @@ def main() -> None:
         if vulnerable_count:
             vulnerable_label = colorize(vulnerable_label, Colors.RED + Colors.BOLD)
         print(f"  {vulnerable_label}")
-        print(f"  Not vulnerable: {len(results) - vulnerable_count - error_count}")
+        potential_label = f"Potentially vulnerable (unconfirmed): {potential_count}"
+        if potential_count:
+            potential_label = colorize(potential_label, Colors.YELLOW + Colors.BOLD)
+        print(f"  {potential_label}")
+        print(f"  Not vulnerable: {not_vulnerable_count}")
         print(f"  Inconclusive/errors: {error_count}")
         print(colorize("=" * 60, Colors.CYAN))
 
